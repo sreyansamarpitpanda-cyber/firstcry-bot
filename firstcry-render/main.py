@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from flask import Flask
 
+# ================= CONFIG =================
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 print("BOT TOKEN EXISTS:", BOT_TOKEN is not None)
 
@@ -21,6 +23,8 @@ HEADERS = {
     "Accept-Language": "en-IN,en;q=0.9",
 }
 
+# ================= FLASK =================
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -30,6 +34,8 @@ def home():
 @app.route("/health")
 def health():
     return "OK", 200
+
+# ================= FILE =================
 
 def load_json(path, default):
     try:
@@ -56,6 +62,8 @@ def save_offset(offset):
     with open(OFFSET_FILE, "w") as f:
         f.write(str(offset))
 
+# ================= TELEGRAM =================
+
 def send_message(chat_id, text):
     try:
         requests.post(
@@ -67,7 +75,7 @@ def send_message(chat_id, text):
         print("Send message error:", e)
 
 def send_item(name, link, image):
-    caption = f"🚨 New FirstCry Item!\n\n{name}\n\n{link}"
+    caption = f"🚨 New Item!\n\n{name}\n\n{link}"
 
     for chat_id in CHAT_IDS:
         try:
@@ -80,19 +88,22 @@ def send_item(name, link, image):
             else:
                 send_message(chat_id, caption)
 
-            print("Alert sent:", name)
+            print("📩 Sent:", name)
+
         except Exception as e:
-            print("Alert error:", e)
+            print("Send error:", e)
+
+# ================= SCRAPER =================
 
 def get_product_id(link):
     nums = re.findall(r"\d{5,}", link)
     if nums:
         return nums[-1]
-    return link.split("?")[0].split("#")[0].rstrip("/").lower()
+    return link.split("?")[0]
 
 def get_items():
     r = requests.get(PAGE_URL, headers=HEADERS, timeout=8)
-    print("Page:", r.status_code, "Size:", len(r.text))
+    print("Scanning:", r.status_code)
 
     soup = BeautifulSoup(r.text, "html.parser")
     items = []
@@ -104,15 +115,7 @@ def get_items():
         if "firstcry.com" not in link:
             continue
 
-        lower_text = text.lower()
-        lower_link = link.lower()
-
-        if (
-            "hot wheels" not in lower_text
-            and "hotwheels" not in lower_text
-            and "hot-wheels" not in lower_link
-            and "hotwheels" not in lower_link
-        ):
+        if "hot" not in text.lower():
             continue
 
         if len(text) < 5:
@@ -120,29 +123,21 @@ def get_items():
 
         img = a.find("img")
         image = ""
-
         if img:
-            image = img.get("src") or img.get("data-src") or img.get("data-original") or ""
-            image = urljoin("https://www.firstcry.com", image)
+            image = img.get("src") or img.get("data-src") or ""
 
         name = " ".join(text.split())
-        name = name.split("ADD TO CART")[0].strip()
-
-        if not name:
-            name = "FirstCry Hot Wheels Item"
 
         items.append({
             "id": get_product_id(link),
-            "name": name[:180],
-            "link": link.split("#")[0],
+            "name": name,
+            "link": link,
             "image": image
         })
 
-    unique = {}
-    for item in items:
-        unique[item["id"]] = item
+    return list({i["id"]: i for i in items}.values())
 
-    return list(unique.values())
+# ================= OWNER CHECK =================
 
 def not_owner_reply(user_id):
     if user_id == OWNER_ID:
@@ -151,34 +146,26 @@ def not_owner_reply(user_id):
     roasts = [
         "Are you owner? 🤨",
         "Bro thinks he owns the bot 💀",
-        "Permission denied 😭 who invited you?",
-        "Nice try, but you're not the boss 😤",
-        "Access denied 🚫 go back to refreshing stock",
-        "You? Owner? That's funny 😂",
-        "Bot said NO 🗿",
-        "Try again when you become owner 😭"
+        "Permission denied 😭",
+        "Nice try, but you're not the boss 😤"
     ]
     return random.choice(roasts)
+
+# ================= COMMANDS =================
 
 def command_reply(text, seen, saved_items, user_id):
     t = text.lower().strip()
 
-    if "hello" in t or "helo" in t or t == "hi":
+    if "hello" in t:
         if user_id == OWNER_ID:
-            return "👑 Yo boss, bot is running perfectly."
-        return "🤨 I am running bro, why you want more? Are you scalping?"
+            return "👑 Bot running perfectly."
+        return "🤨 I am running bro, why you want more?"
 
     if t.startswith("/status"):
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-        return f"✅ Bot running\nSaved items: {len(seen)}\nTracking:\n{PAGE_URL}"
-
-    if t.startswith("/saved"):
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
-        return f"📦 Saved items: {len(seen)}"
+        return f"Saved: {len(seen)}"
 
     if t.startswith("/items"):
         deny = not_owner_reply(user_id)
@@ -187,118 +174,29 @@ def command_reply(text, seen, saved_items, user_id):
 
         items = list(saved_items.values())
         if not items:
-            return "No saved items yet."
+            return "No items"
 
-        msg = f"📦 Saved items ({len(items)}):\n\n"
-        for i, item in enumerate(items[:20], 1):
+        msg = ""
+        for i, item in enumerate(items[:10], 1):
             msg += f"{i}. {item['name']}\n{item['link']}\n\n"
-
-        if len(items) > 20:
-            msg += f"...and {len(items) - 20} more."
-
         return msg
 
-    if t.startswith("/last"):
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
+    return "Use /status /items"
 
-        items = list(saved_items.values())[-5:]
-        if not items:
-            return "No saved items yet."
-
-        msg = "🆕 Last 5 saved items:\n\n"
-        for i, item in enumerate(items, 1):
-            msg += f"{i}. {item['name']}\n{item['link']}\n\n"
-
-        return msg
-
-    if t.startswith("/remove_last"):
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
-
-        if not saved_items:
-            return "No items to remove."
-
-        last_key = list(saved_items.keys())[-1]
-        last_item = saved_items[last_key]
-
-        saved_items.pop(last_key, None)
-        seen.discard(last_key)
-
-        save_json(SEEN_FILE, list(seen))
-        save_json(ITEMS_FILE, saved_items)
-
-        return f"🗑️ Removed last saved item:\n{last_item['name']}"
-
-    if t.startswith("/reset"):
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
-
-        seen.clear()
-        saved_items.clear()
-
-        save_json(SEEN_FILE, [])
-        save_json(ITEMS_FILE, {})
-
-        return "♻️ Reset done. Next scan will silently save current items again."
-
-    if t.startswith("/slay"):
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
-
-        target = text[5:].strip()
-        if not target:
-            return "Use like: /slay udit"
-
-        roasts = [
-            f"{target}, relax bro 😭 the bot is faster than your refresh finger.",
-            f"{target}, refreshing 900 times will not summon the stock 💀",
-            f"{target}, even FirstCry is tired of seeing you reload the page 😂",
-            f"{target}, bro is stalking Hot Wheels like it owes him money 🤨",
-            f"{target}, calm down. The bot is working, your panic is not helping 😭",
-            f"{target}, stock hunting is fine, but you are acting like final boss scalper 💀",
-            f"{target}, let the bot cook. You go drink water first 🫡",
-            f"{target}, your refresh button needs medical insurance at this point 😂"
-        ]
-
-        return random.choice(roasts)
-
-    if t.startswith("/help"):
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
-
-        return (
-            "🤖 Owner Commands:\n"
-            "/status\n"
-            "/saved\n"
-            "/items\n"
-            "/last\n"
-            "/remove_last\n"
-            "/reset\n"
-            "/slay name\n"
-            "/help"
-        )
-
-    return "Use /help"
+# ================= TELEGRAM =================
 
 def check_telegram(seen, saved_items):
     offset = load_offset()
-    reset_done = False
 
     try:
         data = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
             params={"offset": offset + 1, "timeout": 1},
-                    timeout=5
+            timeout=5
         ).json()
     except Exception as e:
         print("Telegram error:", e)
-        return False
+        return
 
     for update in data.get("result", []):
         offset = update["update_id"]
@@ -312,24 +210,16 @@ def check_telegram(seen, saved_items):
         if chat_id not in CHAT_IDS or not text:
             continue
 
-        is_command = text.startswith("/")
-        is_tagged = BOT_USERNAME.lower() in text.lower()
+        if text.startswith("/") or BOT_USERNAME in text:
+            clean = text.replace(BOT_USERNAME, "").strip()
+            reply = command_reply(clean, seen, saved_items, user_id)
+            send_message(chat_id, reply)
 
-        if not is_command and not is_tagged:
-            continue
-
-        clean = text.replace(BOT_USERNAME, "").strip()
-        reply = command_reply(clean, seen, saved_items, user_id)
-        send_message(chat_id, reply)
-
-        if clean.lower().startswith("/reset") and user_id == OWNER_ID:
-            reset_done = True
-
-    return reset_done
+# ================= BOT LOOP =================
 
 def bot_loop():
     if not BOT_TOKEN:
-        print("BOT_TOKEN missing. Add it in Render Environment Variables.")
+        print("BOT_TOKEN missing")
         return
 
     seen = set(load_json(SEEN_FILE, []))
@@ -337,63 +227,43 @@ def bot_loop():
     first_run = len(seen) == 0
 
     print("Bot loop started")
-    print("Owner:", OWNER_ID)
-    print("Bot:", BOT_USERNAME)
 
     while True:
         try:
             check_telegram(seen, saved_items)
 
-            print("Scanning FirstCry...")
             items = get_items()
-            print("Found:", len(items))
 
             if first_run:
-                print("First run silent save")
                 for item in items:
                     seen.add(item["id"])
                     saved_items[item["id"]] = item
 
                 save_json(SEEN_FILE, list(seen))
                 save_json(ITEMS_FILE, saved_items)
-
                 first_run = False
-                print("Saved total:", len(seen))
 
             else:
-                new_count = 0
-
                 for item in items:
                     if item["id"] not in seen:
-                        new_count += 1
-                        print("New:", item["name"])
-
                         send_item(item["name"], item["link"], item["image"])
-
                         seen.add(item["id"])
                         saved_items[item["id"]] = item
 
                         save_json(SEEN_FILE, list(seen))
                         save_json(ITEMS_FILE, saved_items)
 
-                print("New count:", new_count)
-                print("Saved total:", len(seen))
-
-                except Exception as e:
-            print("Main loop error:", e)
+        except Exception as e:
+            print("Error:", e)
 
         wait = random.randint(30, 40)
         print("Waiting:", wait)
 
         for _ in range(wait):
-            try:
-                reset_done = check_telegram(seen, saved_items)
-                if reset_done:
-                    first_run = True
-            except Exception as e:
-                print("Telegram wait error:", e)
-
+            check_telegram(seen, saved_items)
             time.sleep(1)
+
+# ================= START =================
 
 def start_bot():
     print("Starting bot loop...")

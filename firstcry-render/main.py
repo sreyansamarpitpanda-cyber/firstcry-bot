@@ -79,10 +79,32 @@ def send_item(name, link, image):
                 )
             else:
                 send_message(chat_id, caption)
-
             print("Alert sent:", name)
         except:
             return
+
+def set_bot_commands():
+    commands = [
+        {"command": "status", "description": "Bot status"},
+        {"command": "saved", "description": "Saved count"},
+        {"command": "items", "description": "Show saved items"},
+        {"command": "last", "description": "Show last 5 items"},
+        {"command": "remove_last", "description": "Remove last saved item"},
+        {"command": "reset", "description": "Clear saved items"},
+        {"command": "test_notify", "description": "Send one test notification"},
+        {"command": "slay", "description": "Owner roast command"},
+        {"command": "help", "description": "Show commands"},
+    ]
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
+            json={"commands": commands},
+            timeout=5
+        )
+        print("Telegram commands updated")
+    except:
+        pass
 
 def get_product_id(link):
     nums = re.findall(r"\d{5,}", link)
@@ -351,6 +373,7 @@ def bot_loop():
     first_run = len(seen) == 0
 
     print("Bot loop started")
+    set_bot_commands()
 
     while True:
         try:

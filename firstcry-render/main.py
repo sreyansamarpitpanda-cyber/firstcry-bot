@@ -8,7 +8,7 @@ print("BOT TOKEN EXISTS:", BOT_TOKEN is not None)
 
 PAGE_URL = "https://www.firstcry.com/hotwheels/5/0/113?sort=Popularity&q=ard_hotwheels%20&ref2=q_ard_hotwheels%20&asid=53241"
 
-CHAT_IDS = ["-5253322080"]
+CHAT_IDS = ["-1003942411459"]
 BOT_USERNAME = "@fcrestockerbot"
 OWNER_ID = "7754819035"
 

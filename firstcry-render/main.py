@@ -293,8 +293,8 @@ def check_telegram(seen, saved_items):
     try:
         data = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-            params={"offset": offset + 1, "timeout": 0},
-            timeout=2
+            params={"offset": offset + 1, "timeout": 1},
+                    timeout=5
         ).json()
     except Exception as e:
         print("Telegram error:", e)
@@ -386,15 +386,15 @@ def bot_loop():
         print("Waiting:", wait)
 
         # Telegram replies check every 0.5 sec while stock check waits 30-40 sec
-        for _ in range(wait * 2):
-            try:
-                reset_done = check_telegram(seen, saved_items)
-                if reset_done:
-                    first_run = True
-            except Exception as e:
-                print("Telegram wait error:", e)
+       for _ in range(wait):
+    try:
+        reset_done = check_telegram(seen, saved_items)
+        if reset_done:
+            first_run = True
+    except Exception as e:
+        print("Telegram wait error:", e)
 
-            time.sleep(0.5)
+    time.sleep(1) 
 
 def start_bot():
     print("Starting bot loop...")

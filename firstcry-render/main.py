@@ -245,6 +245,20 @@ def command_reply(text, seen, saved_items, user_id):
 
         return "♻️ Reset done. Next scan will silently save current items again."
 
+    if cmd == "/test_notify":
+        deny = not_owner_reply(user_id)
+        if deny:
+            return deny
+
+        items = list(saved_items.values())
+        if not items:
+            return "No saved items to test."
+
+        item = items[-1]
+        send_item(item["name"], item["link"], item["image"])
+
+        return f"✅ Test notification sent:\n{item['name']}"
+
     if cmd == "/slay":
         deny = not_owner_reply(user_id)
         if deny:
@@ -278,6 +292,7 @@ def command_reply(text, seen, saved_items, user_id):
             "/last\n"
             "/remove_last\n"
             "/reset\n"
+            "/test_notify\n"
             "/slay name\n"
             "/help"
         )

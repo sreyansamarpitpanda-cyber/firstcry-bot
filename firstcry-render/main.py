@@ -379,10 +379,10 @@ def bot_loop():
                 print("New count:", new_count)
                 print("Saved total:", len(seen))
 
-        except Exception as e:
+                except Exception as e:
             print("Main loop error:", e)
 
-                wait = random.randint(30, 40)
+        wait = random.randint(30, 40)
         print("Waiting:", wait)
 
         for _ in range(wait):

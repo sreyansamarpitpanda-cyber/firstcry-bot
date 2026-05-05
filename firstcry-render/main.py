@@ -424,7 +424,14 @@ def bot_loop():
 
             time.sleep(1)
 
-threading.Thread(target=bot_loop, daemon=True).start()
+def start_bot():
+    print("Starting bot loop...")
+    bot_loop()
+
+if __name__ == "__main__":
+    threading.Thread(target=start_bot).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

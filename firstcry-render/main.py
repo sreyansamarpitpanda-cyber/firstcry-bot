@@ -275,8 +275,11 @@ def bot_loop():
             print("Error:", e)
 
         wait = random.randint(30, 40)
-        print("Waiting:", wait)
-        time.sleep(wait)
+print("Waiting:", wait)
+
+for _ in range(wait):
+    check_telegram(seen, saved_items)
+    time.sleep(1)
 
 # ================= START =================
 

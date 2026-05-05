@@ -7,7 +7,8 @@ app = Flask(__name__)
 
 PAGE_URL = "https://www.firstcry.com/hotwheels/5/0/113?sort=Popularity&q=ard_hotwheels%20&ref2=q_ard_hotwheels%20&asid=53241"
 
-BOT_TOKEN = os.getenv("8700496444:AAGZwRuMaztDyP0vTBDjmeNe6vGaBdQyWr4")
+print("ENV keys:", list(os.environ.keys()))
+print("BOT TOKEN EXISTS:", "BOT_TOKEN" in os.environ)
 CHAT_IDS = ["-5253322080"]
 
 BOT_USERNAME = "@fcrestockerbot"

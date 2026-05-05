@@ -382,19 +382,18 @@ def bot_loop():
         except Exception as e:
             print("Main loop error:", e)
 
-        wait = random.randint(30, 40)
+                wait = random.randint(30, 40)
         print("Waiting:", wait)
 
-        # Telegram replies check every 0.5 sec while stock check waits 30-40 sec
-       for _ in range(wait):
-    try:
-        reset_done = check_telegram(seen, saved_items)
-        if reset_done:
-            first_run = True
-    except Exception as e:
-        print("Telegram wait error:", e)
+        for _ in range(wait):
+            try:
+                reset_done = check_telegram(seen, saved_items)
+                if reset_done:
+                    first_run = True
+            except Exception as e:
+                print("Telegram wait error:", e)
 
-    time.sleep(1) 
+            time.sleep(1)
 
 def start_bot():
     print("Starting bot loop...")

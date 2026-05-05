@@ -16,6 +16,8 @@ SEEN_FILE = "seen_items.json"
 ITEMS_FILE = "saved_items.json"
 OFFSET_FILE = "telegram_offset.txt"
 
+PROCESSED_UPDATES = set()
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-IN,en;q=0.9",
@@ -79,6 +81,7 @@ def send_item(name, link, image):
                 )
             else:
                 send_message(chat_id, caption)
+
             print("Alert sent:", name)
         except:
             return
@@ -322,6 +325,8 @@ def command_reply(text, seen, saved_items, user_id):
     return "Use /help"
 
 def check_telegram(seen, saved_items):
+    global PROCESSED_UPDATES
+
     offset = load_offset()
     reset_done = False
 
@@ -335,7 +340,17 @@ def check_telegram(seen, saved_items):
         return False
 
     for update in data.get("result", []):
-        offset = update["update_id"]
+        update_id = update["update_id"]
+
+        if update_id in PROCESSED_UPDATES:
+            continue
+
+        PROCESSED_UPDATES.add(update_id)
+
+        if len(PROCESSED_UPDATES) > 1000:
+            PROCESSED_UPDATES.clear()
+
+        offset = update_id
         save_offset(offset)
 
         msg = update.get("message", {})

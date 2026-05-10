@@ -1,10 +1,10 @@
-import json
+    import json
 import os
 import random
 import re
 import threading
 import time
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -156,6 +156,23 @@ def normalize_price(text):
     return clean_text(price)
 
 
+def format_price(value):
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(str(value).replace(",", ""))
+        if number.is_integer():
+            return f"Rs. {int(number)}"
+        return f"Rs. {number:.2f}"
+    except Exception:
+        return normalize_price(str(value)) or str(value)
+
+
+def product_slug(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return slug or "product"
+
+
 def get_product_id(link):
     link = link.split("?")[0].split("#")[0].rstrip("/")
     nums = re.findall(r"\d{5,}", link)
@@ -285,6 +302,66 @@ def parse_items_from_html(html, page_url):
     return list(unique.values())
 
 
+def parse_items_from_api_response(text):
+    items = []
+    try:
+        outer = json.loads(text)
+        inner = outer.get("ProductResponse", outer)
+        if isinstance(inner, str):
+            inner = json.loads(inner)
+        products = inner.get("Products", [])
+    except Exception as exc:
+        print("API parse error:", exc)
+        return []
+
+    for product in products:
+        name = clean_text(product.get("PNm", ""))
+        brand = clean_text(product.get("BNm", ""))
+        combined = f"{brand} {name}".lower()
+        if "hot wheels" not in combined and "hotwheels" not in combined:
+            continue
+
+        pid = str(product.get("PId") or product.get("PInfId") or "").strip()
+        if not pid:
+            continue
+
+        link = f"{BASE_URL}/hot-wheels/{product_slug(name)}/{pid}/product-detail"
+
+        image = ""
+        images = str(product.get("Images") or "").split(";")
+        first_image = next((x.strip() for x in images if x.strip()), "")
+        if first_image:
+            image = f"https://cdn.fcglcdn.com/brainbees/images/products/219x265/{first_image}"
+
+        price = (
+            format_price(product.get("clubprice"))
+            or format_price(product.get("discprice"))
+            or format_price(product.get("MRP"))
+        )
+
+        stock = 0
+        try:
+            stock = int(float(str(product.get("CrntStock") or "0")))
+        except Exception:
+            stock = 0
+
+        items.append(
+            {
+                "id": pid,
+                "name": name[:180] or "FirstCry Hot Wheels Item",
+                "price": price,
+                "link": link,
+                "image": image,
+                "stock": stock,
+            }
+        )
+
+    unique = {}
+    for item in items:
+        unique[item["id"]] = item
+    return list(unique.values())
+
+
 def page_url(page_no):
     if page_no <= 1:
         return PAGE_URL
@@ -295,8 +372,15 @@ def page_url(page_no):
 def api_url(page_no):
     return (
         "https://www.firstcry.com/svcs/ProductFilter.svc/GetSubcategoryWisePagingProducts"
-        f"?PageNo={page_no}&PageSize=20&SortExpression=Popularity&BrandId=113"
-        "&CatId=5&searchwithincat=&q=hotwheels&isclub=0"
+        f"?PageNo={page_no}&PageSize=20&SortExpression=Popularity"
+        "&SubCatId=&BrandId=113&Price=&Age=&Color=&OptionalFilter=&OutOfStock="
+        "&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10="
+        "&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat="
+        "&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr="
+        "&sorting=Popularity&rating=&offer=&CatId=5&skills=&material="
+        "&curatedcollections=&measurement=&gender=&exclude=&p=&premium=&pcode="
+        "&isclub=0&deliverytype=&author=&booktype=&character=&collection=&format="
+        "&genre=&booklanguage=&publication=&skill="
     )
 
 
@@ -316,7 +400,9 @@ def get_items():
             api = api_url(page_no)
             r = requests.get(api, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=15)
             print("API:", page_no, r.status_code, "Size:", len(r.text))
-            all_items.extend(parse_items_from_html(r.text, api))
+            api_items = parse_items_from_api_response(r.text)
+            print("API items:", page_no, len(api_items))
+            all_items.extend(api_items)
         except Exception as exc:
             print("API error:", page_no, exc)
 

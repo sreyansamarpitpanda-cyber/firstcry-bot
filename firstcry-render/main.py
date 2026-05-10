@@ -1,11 +1,20 @@
-import requests, json, time, os, random, re, threading
-from bs4 import BeautifulSoup
+import json
+import os
+import random
+import re
+import threading
+import time
 from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask
+
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 print("BOT TOKEN EXISTS:", BOT_TOKEN is not None)
 
+BASE_URL = "https://www.firstcry.com"
 PAGE_URL = "https://www.firstcry.com/hotwheels/5/0/113?sort=Popularity&q=ard_hotwheels%20&ref2=q_ard_hotwheels%20&asid=53241"
 
 CHAT_IDS = ["-1003942411459"]
@@ -16,75 +25,95 @@ SEEN_FILE = "seen_items.json"
 ITEMS_FILE = "saved_items.json"
 OFFSET_FILE = "telegram_offset.txt"
 
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))
+POLL_MIN_SECONDS = int(os.environ.get("POLL_MIN_SECONDS", "30"))
+POLL_MAX_SECONDS = int(os.environ.get("POLL_MAX_SECONDS", "40"))
+
 PROCESSED_UPDATES = set()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
 }
 
 app = Flask(__name__)
 
+
 @app.route("/")
 def home():
-    return "FirstCry bot running ✅"
+    return "FirstCry bot running", 200
+
 
 @app.route("/health")
 def health():
     return "OK", 200
+
 
 def load_json(path, default):
     try:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except:
+    except Exception:
         pass
     return default
+
 
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
+
 def load_offset():
     try:
         if os.path.exists(OFFSET_FILE):
-            return int(open(OFFSET_FILE).read().strip() or 0)
-    except:
+            return int(open(OFFSET_FILE, encoding="utf-8").read().strip() or 0)
+    except Exception:
         pass
     return 0
 
+
 def save_offset(offset):
-    with open(OFFSET_FILE, "w") as f:
+    with open(OFFSET_FILE, "w", encoding="utf-8") as f:
         f.write(str(offset))
+
 
 def send_message(chat_id, text):
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": chat_id, "text": text[:4000]},
-            timeout=5
+            data={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": False},
+            timeout=8,
         )
-    except:
-        return
+    except Exception as exc:
+        print("send_message error:", exc)
 
-def send_item(name, link, image):
-    caption = f"🚨 New FirstCry Item!\n\n{name}\n\n{link}"
+
+def send_item(name, link, image, price=""):
+    price_line = f"\nPrice: {price}" if price else ""
+    caption = f"New FirstCry Item\n\n{name}{price_line}\n\n{link}"
 
     for chat_id in CHAT_IDS:
         try:
             if image:
-                requests.post(
+                r = requests.post(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    data={"chat_id": chat_id, "photo": image, "caption": caption},
-                    timeout=8
+                    data={"chat_id": chat_id, "photo": image, "caption": caption[:1024]},
+                    timeout=12,
                 )
+                if not r.ok:
+                    print("sendPhoto failed:", r.status_code, r.text[:200])
+                    send_message(chat_id, caption)
             else:
                 send_message(chat_id, caption)
+            print("Alert sent:", name, price)
+        except Exception as exc:
+            print("send_item error:", exc)
 
-            print("Alert sent:", name)
-        except:
-            return
 
 def set_bot_commands():
     commands = [
@@ -98,91 +127,225 @@ def set_bot_commands():
         {"command": "slay", "description": "Owner roast command"},
         {"command": "help", "description": "Show commands"},
     ]
-
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
             json={"commands": commands},
-            timeout=5
+            timeout=8,
         )
         print("Telegram commands updated")
-    except:
-        pass
+    except Exception as exc:
+        print("set commands error:", exc)
+
+
+def clean_text(text):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    text = re.sub(r"\bADD TO CART\b.*", "", text, flags=re.I).strip()
+    text = re.sub(r"\bNotify Me\b.*", "", text, flags=re.I).strip()
+    return text
+
+
+def normalize_price(text):
+    if not text:
+        return ""
+    match = re.search(r"(?:₹|Rs\.?|MRP)\s*[\d,]+(?:\.\d+)?", text, re.I)
+    if not match:
+        return ""
+    price = match.group(0)
+    price = price.replace("MRP", "Rs.").replace("Rs ", "Rs. ")
+    return clean_text(price)
+
 
 def get_product_id(link):
+    link = link.split("?")[0].split("#")[0].rstrip("/")
     nums = re.findall(r"\d{5,}", link)
     if nums:
         return nums[-1]
-    return link.split("?")[0].split("#")[0].rstrip("/").lower()
+    return link.lower()
 
-def get_items():
-    r = requests.get(PAGE_URL, headers=HEADERS, timeout=8)
-    print("Page:", r.status_code, "Size:", len(r.text))
 
-    soup = BeautifulSoup(r.text, "html.parser")
+def looks_like_product_link(link):
+    lower = link.lower()
+    bad = ["javascript:", "#", "/cart", "/login", "/wishlist", "whatsapp", "facebook", "instagram"]
+    if any(x in lower for x in bad):
+        return False
+    return "firstcry.com" in lower and (
+        "/catalog/productdetails" in lower
+        or "/product-detail" in lower
+        or "/p/" in lower
+        or re.search(r"/[a-z0-9-]+/\d{5,}", lower)
+    )
+
+
+def find_image(block, page_url):
+    if not block:
+        return ""
+    img = block.find("img")
+    if not img:
+        return ""
+    src = (
+        img.get("src")
+        or img.get("data-src")
+        or img.get("data-original")
+        or img.get("data-lazy")
+        or img.get("data-original-src")
+        or ""
+    )
+    return urljoin(page_url, src) if src else ""
+
+
+def find_name(block, anchor):
+    candidates = []
+    if anchor:
+        candidates.append(anchor.get_text(" ", strip=True))
+        candidates.append(anchor.get("title", ""))
+    if block:
+        for attr in ["title", "data-name", "data-product-name"]:
+            candidates.append(block.get(attr, ""))
+        for selector in [
+            ".prod-name",
+            ".product-name",
+            ".p-name",
+            ".li_txt1",
+            ".li_txt2",
+            ".prod-title",
+            "h2",
+            "h3",
+        ]:
+            found = block.select_one(selector)
+            if found:
+                candidates.append(found.get_text(" ", strip=True))
+        img = block.find("img")
+        if img:
+            candidates.append(img.get("alt", ""))
+
+    for value in candidates:
+        name = clean_text(value)
+        if not name:
+            continue
+        lower = name.lower()
+        if any(x in lower for x in ["logo", "banner", "payment", "whatsapp"]):
+            continue
+        if "hot wheels" in lower or "hotwheels" in lower or len(name) > 12:
+            return name[:180]
+    return "FirstCry Hot Wheels Item"
+
+
+def find_product_block(anchor):
+    block = anchor
+    best = anchor
+    for _ in range(8):
+        parent = block.find_parent()
+        if not parent:
+            break
+        block = parent
+        text = parent.get_text(" ", strip=True).lower()
+        if any(x in text for x in ["add to cart", "mrp", "₹", "rs.", "hot wheels", "hotwheels"]):
+            best = parent
+        if len(text) > 80 and ("₹" in text or "rs" in text or "mrp" in text):
+            break
+    return best
+
+
+def parse_items_from_html(html, page_url):
+    soup = BeautifulSoup(html, "html.parser")
     items = []
 
-    for a in soup.find_all("a", href=True):
-        link = urljoin("https://www.firstcry.com", a["href"])
-        text = a.get_text(" ", strip=True)
-
-        if "firstcry.com" not in link:
+    for anchor in soup.find_all("a", href=True):
+        link = urljoin(BASE_URL, anchor["href"]).split("#")[0]
+        if not looks_like_product_link(link):
             continue
 
-        lower_text = text.lower()
-        lower_link = link.lower()
+        block = find_product_block(anchor)
+        block_text = block.get_text(" ", strip=True) if block else anchor.get_text(" ", strip=True)
+        link_text = anchor.get_text(" ", strip=True)
+        combined = f"{link_text} {block_text} {link}"
+        lower = combined.lower()
 
-        if (
-            "hot wheels" not in lower_text
-            and "hotwheels" not in lower_text
-            and "hot-wheels" not in lower_link
-            and "hotwheels" not in lower_link
-        ):
+        if "hot wheels" not in lower and "hotwheels" not in lower:
             continue
 
-        if len(text) < 5:
-            continue
+        name = find_name(block, anchor)
+        price = normalize_price(block_text)
+        image = find_image(block, page_url)
 
-        img = a.find("img")
-        image = ""
-
-        if img:
-            image = img.get("src") or img.get("data-src") or img.get("data-original") or ""
-            image = urljoin("https://www.firstcry.com", image)
-
-        name = " ".join(text.split())
-        name = name.split("ADD TO CART")[0].strip()
-
-        if not name:
-            name = "FirstCry Hot Wheels Item"
-
-        items.append({
-            "id": get_product_id(link),
-            "name": name[:180],
-            "link": link.split("#")[0],
-            "image": image
-        })
+        items.append(
+            {
+                "id": get_product_id(link),
+                "name": name,
+                "price": price,
+                "link": link,
+                "image": image,
+            }
+        )
 
     unique = {}
     for item in items:
         unique[item["id"]] = item
+    return list(unique.values())
+
+
+def page_url(page_no):
+    if page_no <= 1:
+        return PAGE_URL
+    sep = "&" if "?" in PAGE_URL else "?"
+    return f"{PAGE_URL}{sep}page={page_no}"
+
+
+def api_url(page_no):
+    return (
+        "https://www.firstcry.com/svcs/ProductFilter.svc/GetSubcategoryWisePagingProducts"
+        f"?PageNo={page_no}&PageSize=20&SortExpression=Popularity&BrandId=113"
+        "&CatId=5&searchwithincat=&q=hotwheels&isclub=0"
+    )
+
+
+def get_items():
+    all_items = []
+
+    for page_no in range(1, SCAN_PAGES + 1):
+        url = page_url(page_no)
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            print("Page:", page_no, r.status_code, "Size:", len(r.text))
+            all_items.extend(parse_items_from_html(r.text, url))
+        except Exception as exc:
+            print("Page error:", page_no, exc)
+
+        try:
+            api = api_url(page_no)
+            r = requests.get(api, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=15)
+            print("API:", page_no, r.status_code, "Size:", len(r.text))
+            all_items.extend(parse_items_from_html(r.text, api))
+        except Exception as exc:
+            print("API error:", page_no, exc)
+
+        time.sleep(random.uniform(0.7, 1.5))
+
+    unique = {}
+    for item in all_items:
+        unique[item["id"]] = item
 
     return list(unique.values())
+
 
 def not_owner_reply(user_id):
     if user_id == OWNER_ID:
         return None
+    return random.choice(
+        [
+            "Are you owner?",
+            "Permission denied.",
+            "Nice try, but you're not the boss.",
+            "Access denied.",
+        ]
+    )
 
-    return random.choice([
-        "Are you owner? 🤨",
-        "Bro thinks he owns the bot 💀",
-        "Permission denied 😭 who invited you?",
-        "Nice try, but you're not the boss 😤",
-        "Access denied 🚫 go back to refreshing stock",
-        "You? Owner? That's funny 😂",
-        "Bot said NO 🗿",
-        "Try again when you become owner 😭"
-    ])
+
+def item_line(i, item):
+    price = f"\nPrice: {item.get('price')}" if item.get("price") else ""
+    return f"{i}. {item['name']}{price}\n{item['link']}\n\n"
+
 
 def command_reply(text, seen, saved_items, user_id):
     t = text.lower().strip()
@@ -190,143 +353,138 @@ def command_reply(text, seen, saved_items, user_id):
 
     if "hello" in t or "helo" in t or t == "hi":
         if user_id == OWNER_ID:
-            return "👑 Yo boss, bot is running perfectly."
-        return "🤨 I am running bro, why you want more? Are you scalping?"
+            return "Yo boss, FirstCry bot is running."
+        return "Bot is running."
 
     if cmd == "/status":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-        return f"✅ Bot running\nSaved items: {len(seen)}\nTracking:\n{PAGE_URL}"
+        return f"FirstCry bot running\nSaved items: {len(seen)}\nScan pages: {SCAN_PAGES}\nTracking:\n{PAGE_URL}"
 
     if cmd == "/saved":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-        return f"📦 Saved items: {len(seen)}"
+        return f"Saved items: {len(seen)}"
 
     if cmd == "/items":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         items = list(saved_items.values())
         if not items:
             return "No saved items yet."
-
-        msg = f"📦 Saved items ({len(items)}):\n\n"
+        msg = f"Saved items ({len(items)}):\n\n"
         for i, item in enumerate(items[:20], 1):
-            msg += f"{i}. {item['name']}\n{item['link']}\n\n"
-
+            msg += item_line(i, item)
         if len(items) > 20:
             msg += f"...and {len(items) - 20} more."
-
         return msg
 
     if cmd == "/last":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         items = list(saved_items.values())[-5:]
         if not items:
             return "No saved items yet."
-
-        msg = "🆕 Last 5 saved items:\n\n"
+        msg = "Last 5 saved items:\n\n"
         for i, item in enumerate(items, 1):
-            msg += f"{i}. {item['name']}\n{item['link']}\n\n"
-
+            msg += item_line(i, item)
         return msg
 
     if cmd == "/remove_last":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         if not saved_items:
             return "No items to remove."
-
         last_key = list(saved_items.keys())[-1]
         last_item = saved_items[last_key]
-
         saved_items.pop(last_key, None)
         seen.discard(last_key)
-
         save_json(SEEN_FILE, list(seen))
         save_json(ITEMS_FILE, saved_items)
-
-        return f"🗑️ Removed last saved item:\n{last_item['name']}"
+        return f"Removed last saved item:\n{last_item['name']}"
 
     if cmd == "/reset":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         seen.clear()
         saved_items.clear()
-
         save_json(SEEN_FILE, [])
         save_json(ITEMS_FILE, {})
-
-        return "♻️ Reset done. Next scan will silently save current items again."
+        return "Reset done. Next scan will silently save current items again."
 
     if cmd == "/test_notify":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         items = list(saved_items.values())
         if not items:
             return "No saved items to test."
-
         item = items[-1]
-        send_item(item["name"], item["link"], item["image"])
-
-        return f"✅ Test notification sent:\n{item['name']}"
+        send_item(item["name"], item["link"], item.get("image", ""), item.get("price", ""))
+        return f"Test notification sent:\n{item['name']}"
 
     if cmd == "/slay":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         target = text[5:].strip()
         if not target:
             return "Use like: /slay udit"
-
-        return random.choice([
-            f"{target}, relax bro 😭 the bot is faster than your refresh finger.",
-            f"{target}, refreshing 900 times will not summon the stock 💀",
-            f"{target}, even FirstCry is tired of seeing you reload the page 😂",
-            f"{target}, bro is stalking Hot Wheels like it owes him money 🤨",
-            f"{target}, calm down. The bot is working, your panic is not helping 😭",
-            f"{target}, stock hunting is fine, but you are acting like final boss scalper 💀",
-            f"{target}, let the bot cook. You go drink water first 🫡",
-            f"{target}, your refresh button needs medical insurance at this point 😂"
-        ])
+        return random.choice(
+            [
+                f"{target}, relax bro. The bot is working.",
+                f"{target}, refreshing 900 times will not summon the stock.",
+                f"{target}, even FirstCry is tired of seeing you reload.",
+            ]
+        )
 
     if cmd == "/help":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-
         return (
-            "🤖 Owner Commands:\n"
-            "/status\n"
-            "/saved\n"
-            "/items\n"
-            "/last\n"
-            "/remove_last\n"
-            "/reset\n"
-            "/test_notify\n"
-            "/slay name\n"
-            "/help"
+            "Owner Commands:\n"
+            "/status\n/saved\n/items\n/last\n/remove_last\n/reset\n"
+            "/test_notify\n/slay name\n/help"
         )
 
     return "Use /help"
 
-def check_telegram(seen, saved_items):
-    global PROCESSED_UPDATES
 
+def should_handle_message(text, chat_id, user_id):
+    if not text:
+        return False, ""
+
+    is_private = chat_id == user_id
+    bot_name = BOT_USERNAME.lower().lstrip("@")
+
+    first = text.strip().split()[0] if text.strip() else ""
+    command_match = re.match(r"^/([a-zA-Z0-9_]+)(?:@([a-zA-Z0-9_]+))?", first)
+
+    if command_match:
+        mentioned_bot = command_match.group(2)
+        if mentioned_bot and mentioned_bot.lower() != bot_name:
+            return False, ""
+        if not is_private and not mentioned_bot:
+            return False, ""
+        clean_first = "/" + command_match.group(1)
+        clean = text.replace(first, clean_first, 1).strip()
+        return True, clean
+
+    if BOT_USERNAME.lower() not in text.lower():
+        return False, ""
+
+    clean = re.sub(re.escape(BOT_USERNAME), "", text, flags=re.I).strip()
+    return True, clean or "/help"
+
+
+def check_telegram(seen, saved_items):
     offset = load_offset()
     reset_done = False
 
@@ -334,49 +492,42 @@ def check_telegram(seen, saved_items):
         data = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
             params={"offset": offset + 1, "timeout": 1},
-            timeout=5
+            timeout=8,
         ).json()
-    except:
+    except Exception as exc:
+        print("Telegram error:", exc)
         return False
 
     for update in data.get("result", []):
         update_id = update["update_id"]
-
         if update_id in PROCESSED_UPDATES:
             continue
-
         PROCESSED_UPDATES.add(update_id)
-
         if len(PROCESSED_UPDATES) > 1000:
             PROCESSED_UPDATES.clear()
-
-        offset = update_id
-        save_offset(offset)
+        save_offset(update_id)
 
         msg = update.get("message", {})
         text = msg.get("text", "")
         chat_id = str(msg.get("chat", {}).get("id", ""))
         user_id = str(msg.get("from", {}).get("id", ""))
 
-        if chat_id not in CHAT_IDS or not text:
+        if chat_id not in CHAT_IDS:
             continue
 
-        is_command = text.startswith("/")
-        is_tagged = BOT_USERNAME.lower() in text.lower()
-
-        if not is_command and not is_tagged:
+        handle, clean = should_handle_message(text, chat_id, user_id)
+        if not handle:
             continue
 
-        clean = text.replace(BOT_USERNAME, "").strip()
         reply = command_reply(clean, seen, saved_items, user_id)
         send_message(chat_id, reply)
 
         clean_cmd = clean.lower().strip().split()[0] if clean.strip() else ""
-
         if clean_cmd == "/reset" and user_id == OWNER_ID:
             reset_done = True
 
     return reset_done
+
 
 def bot_loop():
     if not BOT_TOKEN:
@@ -402,53 +553,46 @@ def bot_loop():
 
             if first_run:
                 print("First run silent save")
-
                 for item in items:
                     seen.add(item["id"])
+                    saved_items[item["id"]] = item
+                save_json(SEEN_FILE, list(seen))
+                save_json(ITEMS_FILE, saved_items)
+                first_run = False
+                print("Saved total:", len(seen))
+            else:
+                new_count = 0
+                for item in items:
+                    if item["id"] not in seen:
+                        new_count += 1
+                        send_item(item["name"], item["link"], item.get("image", ""), item.get("price", ""))
+                        seen.add(item["id"])
                     saved_items[item["id"]] = item
 
                 save_json(SEEN_FILE, list(seen))
                 save_json(ITEMS_FILE, saved_items)
-
-                first_run = False
-                print("Saved total:", len(seen))
-
-            else:
-                new_count = 0
-
-                for item in items:
-                    if item["id"] not in seen:
-                        new_count += 1
-
-                        send_item(item["name"], item["link"], item["image"])
-
-                        seen.add(item["id"])
-                        saved_items[item["id"]] = item
-
-                        save_json(SEEN_FILE, list(seen))
-                        save_json(ITEMS_FILE, saved_items)
-
                 print("New count:", new_count)
                 print("Saved total:", len(seen))
 
-        except Exception as e:
-            print("Main error:", e)
+        except Exception as exc:
+            print("Main error:", exc)
 
-        wait = random.randint(30, 40)
+        wait = random.randint(POLL_MIN_SECONDS, POLL_MAX_SECONDS)
         print("Waiting:", wait)
-
-        for _ in range(wait):
-            reset_done = check_telegram(seen, saved_items)
-            if reset_done:
-                first_run = True
+        for remaining in range(wait, 0, -1):
+            if remaining % 5 == 0:
+                reset_done = check_telegram(seen, saved_items)
+                if reset_done:
+                    first_run = True
             time.sleep(1)
+
 
 def start_bot():
     print("Starting bot loop...")
     bot_loop()
 
-if __name__ == "__main__":
-    threading.Thread(target=start_bot).start()
 
+if __name__ == "__main__":
+    threading.Thread(target=start_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

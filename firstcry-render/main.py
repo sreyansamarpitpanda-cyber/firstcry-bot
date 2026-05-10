@@ -218,7 +218,7 @@ def set_bot_commands():
 def api_url(page_no):
     return (
         "https://www.firstcry.com/svcs/ProductFilter.svc/GetSubcategoryWisePagingProducts"
-        f"?PageNo={page_no}&PageSize=20&SortExpression=Popularity"
+        f"?PageNo={page_no}&PageSize=40&SortExpression=Popularity"
         "&SubCatId=&BrandId=113&Price=&Age=&Color=&OptionalFilter=&OutOfStock="
         "&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10="
         "&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat="

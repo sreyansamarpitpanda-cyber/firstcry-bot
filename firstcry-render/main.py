@@ -15,7 +15,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 print("BOT TOKEN EXISTS:", BOT_TOKEN is not None)
 
 BASE_URL = "https://www.firstcry.com"
-PAGE_URL = "https://www.firstcry.com/hotwheels/5/0/113?sort=Popularity&q=ard_hotwheels%20&ref2=q_ard_hotwheels%20&asid=53241"
+PAGE_URL = "https://www.firstcry.com/hotwheels/5/0/113?sort=Popularity&q=ard_hotwheels%20&source_caller=api&pid=link_share&is_retargeting=true&asid=53241&shortlink=zfg50fvf&ref2=q_ard_hotwheels%20&af_adset=listing_share&deep_link_value=https%3A%2F%2Fwww.firstcry.com%2Fhotwheels%2F5%2F0%2F113%3Fsort%3DPopularity"
 
 CHAT_IDS = ["-1003942411459"]
 BOT_USERNAME = "@fcrestockerbot"

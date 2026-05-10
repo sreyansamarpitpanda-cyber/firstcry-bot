@@ -25,9 +25,10 @@ SEEN_FILE = "seen_items.json"
 ITEMS_FILE = "saved_items.json"
 OFFSET_FILE = "telegram_offset.txt"
 
-SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "8"))
-POLL_MIN_SECONDS = int(os.environ.get("POLL_MIN_SECONDS", "30"))
-POLL_MAX_SECONDS = int(os.environ.get("POLL_MAX_SECONDS", "40"))
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "1"))
+POLL_MIN_SECONDS = int(os.environ.get("POLL_MIN_SECONDS", "5"))
+POLL_MAX_SECONDS = int(os.environ.get("POLL_MAX_SECONDS", "8"))
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "6"))
 
 PROCESSED_UPDATES = set()
 
@@ -87,30 +88,19 @@ def send_message(chat_id, text):
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": False},
-            timeout=8,
+            timeout=4,
         )
     except Exception as exc:
         print("send_message error:", exc)
 
 
-def send_item(name, link, image, price=""):
-    price_line = f"\nPrice: {price}" if price else ""
-    caption = f"New FirstCry Item\n\n{name}{price_line}\n\n{link}"
+def send_item(name, link, image="", price=""):
+    caption = f"New FirstCry Item\n\n{name}\n\n{link}"
 
     for chat_id in CHAT_IDS:
         try:
-            if image:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    data={"chat_id": chat_id, "photo": image, "caption": caption[:1024]},
-                    timeout=12,
-                )
-                if not r.ok:
-                    print("sendPhoto failed:", r.status_code, r.text[:200])
-                    send_message(chat_id, caption)
-            else:
-                send_message(chat_id, caption)
-            print("Alert sent:", name, price)
+            send_message(chat_id, caption)
+            print("Alert sent:", name)
         except Exception as exc:
             print("send_item error:", exc)
 
@@ -123,7 +113,8 @@ def set_bot_commands():
         {"command": "last", "description": "Show last 5 items"},
         {"command": "remove_last", "description": "Remove last saved item"},
         {"command": "reset", "description": "Clear saved items"},
-        {"command": "test_notify", "description": "Send one test notification"},
+        {"command": "test_notify", "description": "Send a test stock alert"},
+        {"command": "test_alert", "description": "Send a test stock alert"},
         {"command": "slay", "description": "Owner roast command"},
         {"command": "help", "description": "Show commands"},
     ]
@@ -390,7 +381,7 @@ def get_items():
     for page_no in range(1, SCAN_PAGES + 1):
         url = page_url(page_no)
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
             print("Page:", page_no, r.status_code, "Size:", len(r.text))
             all_items.extend(parse_items_from_html(r.text, url))
         except Exception as exc:
@@ -398,7 +389,7 @@ def get_items():
 
         try:
             api = api_url(page_no)
-            r = requests.get(api, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=15)
+            r = requests.get(api, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=REQUEST_TIMEOUT_SECONDS)
             print("API:", page_no, r.status_code, "Size:", len(r.text))
             api_items = parse_items_from_api_response(r.text)
             print("API items:", page_no, len(api_items))
@@ -406,7 +397,8 @@ def get_items():
         except Exception as exc:
             print("API error:", page_no, exc)
 
-        time.sleep(random.uniform(0.7, 1.5))
+        if page_no < SCAN_PAGES:
+            time.sleep(random.uniform(0.2, 0.5))
 
     unique = {}
     for item in all_items:
@@ -446,7 +438,15 @@ def command_reply(text, seen, saved_items, user_id):
         deny = not_owner_reply(user_id)
         if deny:
             return deny
-        return f"FirstCry bot running\nSaved items: {len(seen)}\nScan pages: {SCAN_PAGES}\nTracking:\n{PAGE_URL}"
+        return (
+            f"FirstCry bot running\n"
+            f"Saved items: {len(seen)}\n"
+            f"Scan pages: {SCAN_PAGES}\n"
+            f"Poll: {POLL_MIN_SECONDS}-{POLL_MAX_SECONDS}s\n"
+            f"Request timeout: {REQUEST_TIMEOUT_SECONDS}s\n"
+            f"Photos: off\n"
+            f"Tracking:\n{PAGE_URL}"
+        )
 
     if cmd == "/saved":
         deny = not_owner_reply(user_id)
@@ -504,14 +504,17 @@ def command_reply(text, seen, saved_items, user_id):
         save_json(ITEMS_FILE, {})
         return "Reset done. Next scan will silently save current items again."
 
-    if cmd == "/test_notify":
+    if cmd in {"/test_notify", "/test_alert"}:
         deny = not_owner_reply(user_id)
         if deny:
             return deny
         items = list(saved_items.values())
-        if not items:
-            return "No saved items to test."
-        item = items[-1]
+        item = items[-1] if items else {
+            "name": "TEST ALERT - FirstCry Hot Wheels",
+            "link": PAGE_URL,
+            "image": "",
+            "price": "Rs. 0",
+        }
         send_item(item["name"], item["link"], item.get("image", ""), item.get("price", ""))
         return f"Test notification sent:\n{item['name']}"
 
@@ -537,7 +540,7 @@ def command_reply(text, seen, saved_items, user_id):
         return (
             "Owner Commands:\n"
             "/status\n/saved\n/items\n/last\n/remove_last\n/reset\n"
-            "/test_notify\n/slay name\n/help"
+            "/test_notify\n/test_alert\n/slay name\n/help"
         )
 
     return "Use /help"

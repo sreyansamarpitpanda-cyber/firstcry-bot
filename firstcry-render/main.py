@@ -2,11 +2,17 @@ import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 
 import requests
 from flask import Flask
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -30,8 +36,9 @@ REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "4"))
 FIRSTCRY_BACKOFF_SECONDS = int(os.environ.get("FIRSTCRY_BACKOFF_SECONDS", "60"))
 
 PROCESSED_UPDATES = set()
-BOT_THREAD_STARTED = False
 FIRSTCRY_BACKOFF_UNTIL = 0
+BOT_THREAD = None
+BOT_THREAD_LOCK = threading.Lock()
 
 HEADERS = {
     "User-Agent": (
@@ -53,12 +60,28 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
+    ensure_bot_started()
     return "FirstCry bot running", 200
 
 
 @app.route("/health")
 def health():
+    ensure_bot_started()
     return "OK", 200
+
+
+@app.route("/debug")
+def debug():
+    ensure_bot_started()
+    thread_alive = BOT_THREAD.is_alive() if BOT_THREAD else False
+    return (
+        f"BOT_TOKEN_EXISTS={BOT_TOKEN is not None}\n"
+        f"BOT_THREAD_ALIVE={thread_alive}\n"
+        f"SCAN_PAGES={SCAN_PAGES}\n"
+        f"POLL={POLL_MIN_SECONDS}-{POLL_MAX_SECONDS}s\n"
+        f"REQUEST_TIMEOUT={REQUEST_TIMEOUT_SECONDS}s\n"
+        f"FIRSTCRY_BACKOFF={firstcry_backoff_remaining()}s\n"
+    ), 200
 
 
 def load_json(path, default):
@@ -66,28 +89,34 @@ def load_json(path, default):
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as exc:
+        print("load_json error:", path, exc)
     return default
 
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        print("save_json error:", path, exc)
 
 
 def load_offset():
     try:
         if os.path.exists(OFFSET_FILE):
             return int(open(OFFSET_FILE, encoding="utf-8").read().strip() or 0)
-    except Exception:
-        pass
+    except Exception as exc:
+        print("load_offset error:", exc)
     return 0
 
 
 def save_offset(offset):
-    with open(OFFSET_FILE, "w", encoding="utf-8") as f:
-        f.write(str(offset))
+    try:
+        with open(OFFSET_FILE, "w", encoding="utf-8") as f:
+            f.write(str(offset))
+    except Exception as exc:
+        print("save_offset error:", exc)
 
 
 def clean_text(text):
@@ -158,11 +187,8 @@ def send_item(name, link, image="", price=""):
     caption = f"New FirstCry Item\n\n{name}\n\n{link}"
 
     for chat_id in CHAT_IDS:
-        try:
-            send_message(chat_id, caption)
-            print("Alert sent:", name)
-        except Exception as exc:
-            print("send_item error:", exc)
+        send_message(chat_id, caption)
+        print("Alert sent:", name)
 
 
 def set_bot_commands():
@@ -204,6 +230,28 @@ def api_url(page_no):
     )
 
 
+def product_is_in_stock(product):
+    for key in ["CrntStock", "CurrentStock", "Stock", "Qty", "Quantity"]:
+        value = product.get(key)
+        if value not in (None, ""):
+            try:
+                return int(float(str(value))) > 0
+            except Exception:
+                pass
+
+    text = json.dumps(product).lower()
+    out_words = ["out of stock", "notify me", "sold out", "unavailable"]
+    in_words = ["add to cart", "in stock", "available"]
+
+    if any(word in text for word in out_words):
+        return False
+
+    if any(word in text for word in in_words):
+        return True
+
+    return False
+
+
 def parse_items_from_api_response(text):
     items = []
 
@@ -229,16 +277,11 @@ def parse_items_from_api_response(text):
         if not pid:
             continue
 
-        stock = 0
-        try:
-            stock = int(float(str(product.get("CrntStock") or "0")))
-        except Exception:
-            stock = 0
-
-        if stock <= 0:
+        if not product_is_in_stock(product):
             continue
 
         link = f"{BASE_URL}/hot-wheels/{product_slug(name)}/{pid}/product-detail"
+
         price = (
             format_price(product.get("clubprice"))
             or format_price(product.get("discprice"))
@@ -251,7 +294,6 @@ def parse_items_from_api_response(text):
                 "name": name[:180] or "FirstCry Hot Wheels Item",
                 "price": price,
                 "link": link,
-                "stock": stock,
             }
         )
 
@@ -397,7 +439,6 @@ def command_reply(text, seen, saved_items, user_id):
         item = items[-1] if items else {
             "name": "TEST ALERT - FirstCry Hot Wheels",
             "link": PAGE_URL,
-            "price": "",
         }
 
         send_item(item["name"], item["link"])
@@ -562,18 +603,22 @@ def bot_loop():
 
 def start_bot():
     print("Starting bot loop...")
-    bot_loop()
-
-
-BOT_THREAD_STARTED = False
+    try:
+        bot_loop()
+    except Exception as exc:
+        print("Bot thread crashed:", repr(exc))
 
 
 def ensure_bot_started():
-    global BOT_THREAD_STARTED
-    if BOT_THREAD_STARTED:
-        return
-    BOT_THREAD_STARTED = True
-    threading.Thread(target=start_bot, daemon=True).start()
+    global BOT_THREAD
+
+    with BOT_THREAD_LOCK:
+        if BOT_THREAD and BOT_THREAD.is_alive():
+            return
+
+        print("Starting bot thread...")
+        BOT_THREAD = threading.Thread(target=start_bot, name="firstcry-bot", daemon=True)
+        BOT_THREAD.start()
 
 
 ensure_bot_started()
@@ -582,4 +627,3 @@ ensure_bot_started()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-

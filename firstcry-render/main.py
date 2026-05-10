@@ -30,6 +30,7 @@ REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "4"))
 FIRSTCRY_BACKOFF_SECONDS = int(os.environ.get("FIRSTCRY_BACKOFF_SECONDS", "60"))
 
 PROCESSED_UPDATES = set()
+BOT_THREAD_STARTED = False
 FIRSTCRY_BACKOFF_UNTIL = 0
 
 HEADERS = {
@@ -564,7 +565,21 @@ def start_bot():
     bot_loop()
 
 
-if __name__ == "__main__":
+BOT_THREAD_STARTED = False
+
+
+def ensure_bot_started():
+    global BOT_THREAD_STARTED
+    if BOT_THREAD_STARTED:
+        return
+    BOT_THREAD_STARTED = True
     threading.Thread(target=start_bot, daemon=True).start()
+
+
+ensure_bot_started()
+
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+

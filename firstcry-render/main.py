@@ -4,10 +4,8 @@ import random
 import re
 import threading
 import time
-from urllib.parse import quote, urljoin
 
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask
 
 
@@ -26,20 +24,28 @@ ITEMS_FILE = "saved_items.json"
 OFFSET_FILE = "telegram_offset.txt"
 
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "1"))
-POLL_MIN_SECONDS = int(os.environ.get("POLL_MIN_SECONDS", "5"))
-POLL_MAX_SECONDS = int(os.environ.get("POLL_MAX_SECONDS", "8"))
-REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "6"))
+POLL_MIN_SECONDS = int(os.environ.get("POLL_MIN_SECONDS", "4"))
+POLL_MAX_SECONDS = int(os.environ.get("POLL_MAX_SECONDS", "6"))
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "4"))
+FIRSTCRY_BACKOFF_SECONDS = int(os.environ.get("FIRSTCRY_BACKOFF_SECONDS", "60"))
 
 PROCESSED_UPDATES = set()
+FIRSTCRY_BACKOFF_UNTIL = 0
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "en-IN,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
 }
+
+FIRSTCRY_SESSION = requests.Session()
+FIRSTCRY_SESSION.headers.update(HEADERS)
+
+TELEGRAM_SESSION = requests.Session()
 
 app = Flask(__name__)
 
@@ -83,11 +89,64 @@ def save_offset(offset):
         f.write(str(offset))
 
 
+def clean_text(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def product_slug(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return slug or "product"
+
+
+def format_price(value):
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(str(value).replace(",", ""))
+        if number.is_integer():
+            return f"Rs. {int(number)}"
+        return f"Rs. {number:.2f}"
+    except Exception:
+        return clean_text(value)
+
+
+def firstcry_backoff_remaining():
+    return max(0, int(FIRSTCRY_BACKOFF_UNTIL - time.time()))
+
+
+def firstcry_get(url):
+    global FIRSTCRY_BACKOFF_UNTIL
+
+    remaining = firstcry_backoff_remaining()
+    if remaining > 0:
+        print("FirstCry backoff active:", remaining, "seconds")
+        return None
+
+    r = FIRSTCRY_SESSION.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+
+    if r.status_code in (403, 429):
+        retry_after = r.headers.get("Retry-After", "")
+        try:
+            delay = int(float(retry_after))
+        except Exception:
+            delay = FIRSTCRY_BACKOFF_SECONDS
+
+        delay = max(delay, FIRSTCRY_BACKOFF_SECONDS)
+        FIRSTCRY_BACKOFF_UNTIL = time.time() + delay
+        print("FirstCry slow-down response:", r.status_code, "Backoff:", delay)
+
+    return r
+
+
 def send_message(chat_id, text):
     try:
-        requests.post(
+        TELEGRAM_SESSION.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": False},
+            data={
+                "chat_id": chat_id,
+                "text": text[:4000],
+                "disable_web_page_preview": False,
+            },
             timeout=4,
         )
     except Exception as exc:
@@ -115,11 +174,11 @@ def set_bot_commands():
         {"command": "reset", "description": "Clear saved items"},
         {"command": "test_notify", "description": "Send a test stock alert"},
         {"command": "test_alert", "description": "Send a test stock alert"},
-        {"command": "slay", "description": "Owner roast command"},
         {"command": "help", "description": "Show commands"},
     ]
+
     try:
-        requests.post(
+        TELEGRAM_SESSION.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
             json={"commands": commands},
             timeout=8,
@@ -127,237 +186,6 @@ def set_bot_commands():
         print("Telegram commands updated")
     except Exception as exc:
         print("set commands error:", exc)
-
-
-def clean_text(text):
-    text = re.sub(r"\s+", " ", text or "").strip()
-    text = re.sub(r"\bADD TO CART\b.*", "", text, flags=re.I).strip()
-    text = re.sub(r"\bNotify Me\b.*", "", text, flags=re.I).strip()
-    return text
-
-
-def normalize_price(text):
-    if not text:
-        return ""
-    match = re.search(r"(?:₹|Rs\.?|MRP)\s*[\d,]+(?:\.\d+)?", text, re.I)
-    if not match:
-        return ""
-    price = match.group(0)
-    price = price.replace("MRP", "Rs.").replace("Rs ", "Rs. ")
-    return clean_text(price)
-
-
-def format_price(value):
-    if value in (None, ""):
-        return ""
-    try:
-        number = float(str(value).replace(",", ""))
-        if number.is_integer():
-            return f"Rs. {int(number)}"
-        return f"Rs. {number:.2f}"
-    except Exception:
-        return normalize_price(str(value)) or str(value)
-
-
-def product_slug(name):
-    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
-    return slug or "product"
-
-
-def get_product_id(link):
-    link = link.split("?")[0].split("#")[0].rstrip("/")
-    nums = re.findall(r"\d{5,}", link)
-    if nums:
-        return nums[-1]
-    return link.lower()
-
-
-def looks_like_product_link(link):
-    lower = link.lower()
-    bad = ["javascript:", "#", "/cart", "/login", "/wishlist", "whatsapp", "facebook", "instagram"]
-    if any(x in lower for x in bad):
-        return False
-    return "firstcry.com" in lower and (
-        "/catalog/productdetails" in lower
-        or "/product-detail" in lower
-        or "/p/" in lower
-        or re.search(r"/[a-z0-9-]+/\d{5,}", lower)
-    )
-
-
-def find_image(block, page_url):
-    if not block:
-        return ""
-    img = block.find("img")
-    if not img:
-        return ""
-    src = (
-        img.get("src")
-        or img.get("data-src")
-        or img.get("data-original")
-        or img.get("data-lazy")
-        or img.get("data-original-src")
-        or ""
-    )
-    return urljoin(page_url, src) if src else ""
-
-
-def find_name(block, anchor):
-    candidates = []
-    if anchor:
-        candidates.append(anchor.get_text(" ", strip=True))
-        candidates.append(anchor.get("title", ""))
-    if block:
-        for attr in ["title", "data-name", "data-product-name"]:
-            candidates.append(block.get(attr, ""))
-        for selector in [
-            ".prod-name",
-            ".product-name",
-            ".p-name",
-            ".li_txt1",
-            ".li_txt2",
-            ".prod-title",
-            "h2",
-            "h3",
-        ]:
-            found = block.select_one(selector)
-            if found:
-                candidates.append(found.get_text(" ", strip=True))
-        img = block.find("img")
-        if img:
-            candidates.append(img.get("alt", ""))
-
-    for value in candidates:
-        name = clean_text(value)
-        if not name:
-            continue
-        lower = name.lower()
-        if any(x in lower for x in ["logo", "banner", "payment", "whatsapp"]):
-            continue
-        if "hot wheels" in lower or "hotwheels" in lower or len(name) > 12:
-            return name[:180]
-    return "FirstCry Hot Wheels Item"
-
-
-def find_product_block(anchor):
-    block = anchor
-    best = anchor
-    for _ in range(8):
-        parent = block.find_parent()
-        if not parent:
-            break
-        block = parent
-        text = parent.get_text(" ", strip=True).lower()
-        if any(x in text for x in ["add to cart", "mrp", "₹", "rs.", "hot wheels", "hotwheels"]):
-            best = parent
-        if len(text) > 80 and ("₹" in text or "rs" in text or "mrp" in text):
-            break
-    return best
-
-
-def parse_items_from_html(html, page_url):
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-
-    for anchor in soup.find_all("a", href=True):
-        link = urljoin(BASE_URL, anchor["href"]).split("#")[0]
-        if not looks_like_product_link(link):
-            continue
-
-        block = find_product_block(anchor)
-        block_text = block.get_text(" ", strip=True) if block else anchor.get_text(" ", strip=True)
-        link_text = anchor.get_text(" ", strip=True)
-        combined = f"{link_text} {block_text} {link}"
-        lower = combined.lower()
-
-        if "hot wheels" not in lower and "hotwheels" not in lower:
-            continue
-
-        name = find_name(block, anchor)
-        price = normalize_price(block_text)
-        image = find_image(block, page_url)
-
-        items.append(
-            {
-                "id": get_product_id(link),
-                "name": name,
-                "price": price,
-                "link": link,
-                "image": image,
-            }
-        )
-
-    unique = {}
-    for item in items:
-        unique[item["id"]] = item
-    return list(unique.values())
-
-
-def parse_items_from_api_response(text):
-    items = []
-    try:
-        outer = json.loads(text)
-        inner = outer.get("ProductResponse", outer)
-        if isinstance(inner, str):
-            inner = json.loads(inner)
-        products = inner.get("Products", [])
-    except Exception as exc:
-        print("API parse error:", exc)
-        return []
-
-    for product in products:
-        name = clean_text(product.get("PNm", ""))
-        brand = clean_text(product.get("BNm", ""))
-        combined = f"{brand} {name}".lower()
-        if "hot wheels" not in combined and "hotwheels" not in combined:
-            continue
-
-        pid = str(product.get("PId") or product.get("PInfId") or "").strip()
-        if not pid:
-            continue
-
-        link = f"{BASE_URL}/hot-wheels/{product_slug(name)}/{pid}/product-detail"
-
-        image = ""
-        images = str(product.get("Images") or "").split(";")
-        first_image = next((x.strip() for x in images if x.strip()), "")
-        if first_image:
-            image = f"https://cdn.fcglcdn.com/brainbees/images/products/219x265/{first_image}"
-
-        price = (
-            format_price(product.get("clubprice"))
-            or format_price(product.get("discprice"))
-            or format_price(product.get("MRP"))
-        )
-
-        stock = 0
-        try:
-            stock = int(float(str(product.get("CrntStock") or "0")))
-        except Exception:
-            stock = 0
-
-        items.append(
-            {
-                "id": pid,
-                "name": name[:180] or "FirstCry Hot Wheels Item",
-                "price": price,
-                "link": link,
-                "image": image,
-                "stock": stock,
-            }
-        )
-
-    unique = {}
-    for item in items:
-        unique[item["id"]] = item
-    return list(unique.values())
-
-
-def page_url(page_no):
-    if page_no <= 1:
-        return PAGE_URL
-    sep = "&" if "?" in PAGE_URL else "?"
-    return f"{PAGE_URL}{sep}page={page_no}"
 
 
 def api_url(page_no):
@@ -375,25 +203,79 @@ def api_url(page_no):
     )
 
 
+def parse_items_from_api_response(text):
+    items = []
+
+    try:
+        outer = json.loads(text)
+        inner = outer.get("ProductResponse", outer)
+        if isinstance(inner, str):
+            inner = json.loads(inner)
+        products = inner.get("Products", [])
+    except Exception as exc:
+        print("API parse error:", exc)
+        return []
+
+    for product in products:
+        name = clean_text(product.get("PNm", ""))
+        brand = clean_text(product.get("BNm", ""))
+        combined = f"{brand} {name}".lower()
+
+        if "hot wheels" not in combined and "hotwheels" not in combined:
+            continue
+
+        pid = str(product.get("PId") or product.get("PInfId") or "").strip()
+        if not pid:
+            continue
+
+        stock = 0
+        try:
+            stock = int(float(str(product.get("CrntStock") or "0")))
+        except Exception:
+            stock = 0
+
+        if stock <= 0:
+            continue
+
+        link = f"{BASE_URL}/hot-wheels/{product_slug(name)}/{pid}/product-detail"
+        price = (
+            format_price(product.get("clubprice"))
+            or format_price(product.get("discprice"))
+            or format_price(product.get("MRP"))
+        )
+
+        items.append(
+            {
+                "id": pid,
+                "name": name[:180] or "FirstCry Hot Wheels Item",
+                "price": price,
+                "link": link,
+                "stock": stock,
+            }
+        )
+
+    unique = {}
+    for item in items:
+        unique[item["id"]] = item
+
+    return list(unique.values())
+
+
 def get_items():
     all_items = []
 
     for page_no in range(1, SCAN_PAGES + 1):
-        url = page_url(page_no)
         try:
-            r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
-            print("Page:", page_no, r.status_code, "Size:", len(r.text))
-            all_items.extend(parse_items_from_html(r.text, url))
-        except Exception as exc:
-            print("Page error:", page_no, exc)
+            r = firstcry_get(api_url(page_no))
+            if r is None:
+                continue
 
-        try:
-            api = api_url(page_no)
-            r = requests.get(api, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=REQUEST_TIMEOUT_SECONDS)
             print("API:", page_no, r.status_code, "Size:", len(r.text))
-            api_items = parse_items_from_api_response(r.text)
-            print("API items:", page_no, len(api_items))
-            all_items.extend(api_items)
+
+            if r.ok:
+                api_items = parse_items_from_api_response(r.text)
+                print("In-stock API items:", page_no, len(api_items))
+                all_items.extend(api_items)
         except Exception as exc:
             print("API error:", page_no, exc)
 
@@ -410,19 +292,11 @@ def get_items():
 def not_owner_reply(user_id):
     if user_id == OWNER_ID:
         return None
-    return random.choice(
-        [
-            "Are you owner?",
-            "Permission denied.",
-            "Nice try, but you're not the boss.",
-            "Access denied.",
-        ]
-    )
+    return "Permission denied."
 
 
 def item_line(i, item):
-    price = f"\nPrice: {item.get('price')}" if item.get("price") else ""
-    return f"{i}. {item['name']}{price}\n{item['link']}\n\n"
+    return f"{i}. {item['name']}\n{item['link']}\n\n"
 
 
 def command_reply(text, seen, saved_items, user_id):
@@ -430,9 +304,7 @@ def command_reply(text, seen, saved_items, user_id):
     cmd = t.split()[0] if t else ""
 
     if "hello" in t or "helo" in t or t == "hi":
-        if user_id == OWNER_ID:
-            return "Yo boss, FirstCry bot is running."
-        return "Bot is running."
+        return "Yo boss, FirstCry bot is running." if user_id == OWNER_ID else "Bot is running."
 
     if cmd == "/status":
         deny = not_owner_reply(user_id)
@@ -444,6 +316,7 @@ def command_reply(text, seen, saved_items, user_id):
             f"Scan pages: {SCAN_PAGES}\n"
             f"Poll: {POLL_MIN_SECONDS}-{POLL_MAX_SECONDS}s\n"
             f"Request timeout: {REQUEST_TIMEOUT_SECONDS}s\n"
+            f"FirstCry backoff: {firstcry_backoff_remaining()}s\n"
             f"Photos: off\n"
             f"Tracking:\n{PAGE_URL}"
         )
@@ -458,9 +331,11 @@ def command_reply(text, seen, saved_items, user_id):
         deny = not_owner_reply(user_id)
         if deny:
             return deny
+
         items = list(saved_items.values())
         if not items:
             return "No saved items yet."
+
         msg = f"Saved items ({len(items)}):\n\n"
         for i, item in enumerate(items[:20], 1):
             msg += item_line(i, item)
@@ -472,9 +347,11 @@ def command_reply(text, seen, saved_items, user_id):
         deny = not_owner_reply(user_id)
         if deny:
             return deny
+
         items = list(saved_items.values())[-5:]
         if not items:
             return "No saved items yet."
+
         msg = "Last 5 saved items:\n\n"
         for i, item in enumerate(items, 1):
             msg += item_line(i, item)
@@ -484,63 +361,56 @@ def command_reply(text, seen, saved_items, user_id):
         deny = not_owner_reply(user_id)
         if deny:
             return deny
+
         if not saved_items:
             return "No items to remove."
+
         last_key = list(saved_items.keys())[-1]
         last_item = saved_items[last_key]
         saved_items.pop(last_key, None)
         seen.discard(last_key)
+
         save_json(SEEN_FILE, list(seen))
         save_json(ITEMS_FILE, saved_items)
+
         return f"Removed last saved item:\n{last_item['name']}"
 
     if cmd == "/reset":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
+
         seen.clear()
         saved_items.clear()
         save_json(SEEN_FILE, [])
         save_json(ITEMS_FILE, {})
-        return "Reset done. Next scan will silently save current items again."
+
+        return "Reset done. Next scan will silently save current in-stock items again."
 
     if cmd in {"/test_notify", "/test_alert"}:
         deny = not_owner_reply(user_id)
         if deny:
             return deny
+
         items = list(saved_items.values())
         item = items[-1] if items else {
             "name": "TEST ALERT - FirstCry Hot Wheels",
             "link": PAGE_URL,
-            "image": "",
-            "price": "Rs. 0",
+            "price": "",
         }
-        send_item(item["name"], item["link"], item.get("image", ""), item.get("price", ""))
-        return f"Test notification sent:\n{item['name']}"
 
-    if cmd == "/slay":
-        deny = not_owner_reply(user_id)
-        if deny:
-            return deny
-        target = text[5:].strip()
-        if not target:
-            return "Use like: /slay udit"
-        return random.choice(
-            [
-                f"{target}, relax bro. The bot is working.",
-                f"{target}, refreshing 900 times will not summon the stock.",
-                f"{target}, even FirstCry is tired of seeing you reload.",
-            ]
-        )
+        send_item(item["name"], item["link"])
+        return f"Test notification sent:\n{item['name']}"
 
     if cmd == "/help":
         deny = not_owner_reply(user_id)
         if deny:
             return deny
+
         return (
             "Owner Commands:\n"
             "/status\n/saved\n/items\n/last\n/remove_last\n/reset\n"
-            "/test_notify\n/test_alert\n/slay name\n/help"
+            "/test_notify\n/test_alert\n/help"
         )
 
     return "Use /help"
@@ -558,10 +428,13 @@ def should_handle_message(text, chat_id, user_id):
 
     if command_match:
         mentioned_bot = command_match.group(2)
+
         if mentioned_bot and mentioned_bot.lower() != bot_name:
             return False, ""
+
         if not is_private and not mentioned_bot:
             return False, ""
+
         clean_first = "/" + command_match.group(1)
         clean = text.replace(first, clean_first, 1).strip()
         return True, clean
@@ -578,7 +451,7 @@ def check_telegram(seen, saved_items):
     reset_done = False
 
     try:
-        data = requests.get(
+        data = TELEGRAM_SESSION.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
             params={"offset": offset + 1, "timeout": 1},
             timeout=8,
@@ -589,11 +462,14 @@ def check_telegram(seen, saved_items):
 
     for update in data.get("result", []):
         update_id = update["update_id"]
+
         if update_id in PROCESSED_UPDATES:
             continue
+
         PROCESSED_UPDATES.add(update_id)
         if len(PROCESSED_UPDATES) > 1000:
             PROCESSED_UPDATES.clear()
+
         save_offset(update_id)
 
         msg = update.get("message", {})
@@ -638,28 +514,33 @@ def bot_loop():
 
             print("Scanning FirstCry...")
             items = get_items()
-            print("Found:", len(items))
+            print("Found in-stock:", len(items))
 
             if first_run:
                 print("First run silent save")
                 for item in items:
                     seen.add(item["id"])
                     saved_items[item["id"]] = item
+
                 save_json(SEEN_FILE, list(seen))
                 save_json(ITEMS_FILE, saved_items)
+
                 first_run = False
                 print("Saved total:", len(seen))
             else:
                 new_count = 0
+
                 for item in items:
                     if item["id"] not in seen:
                         new_count += 1
-                        send_item(item["name"], item["link"], item.get("image", ""), item.get("price", ""))
+                        send_item(item["name"], item["link"])
                         seen.add(item["id"])
+
                     saved_items[item["id"]] = item
 
                 save_json(SEEN_FILE, list(seen))
                 save_json(ITEMS_FILE, saved_items)
+
                 print("New count:", new_count)
                 print("Saved total:", len(seen))
 
@@ -668,11 +549,13 @@ def bot_loop():
 
         wait = random.randint(POLL_MIN_SECONDS, POLL_MAX_SECONDS)
         print("Waiting:", wait)
+
         for remaining in range(wait, 0, -1):
             if remaining % 5 == 0:
                 reset_done = check_telegram(seen, saved_items)
                 if reset_done:
                     first_run = True
+
             time.sleep(1)
 
 
